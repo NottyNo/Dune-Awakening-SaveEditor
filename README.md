@@ -38,12 +38,23 @@ beside the target and refuses to overwrite a file that changed after it was open
 
 ## Item catalog
 
-The bundled catalog is generated from FModel's `CDT_BaseItems.json`. Rebuild it
-after a game update:
+Users do **not** need FModel or any exported datatables to use the editor. A generated
+catalog is bundled with every source release, so item search and adding items work
+immediately after downloading the repository or a future executable.
+
+When a game patch changes item IDs or item metadata, the bundled catalog must be refreshed
+before those changes can appear in the editor. The project maintainer will update and
+publish the catalog for each relevant patch. Users should update to that release rather
+than extracting the datatables themselves.
+
+For contributors or maintainers who have a new FModel export, rebuild the catalog with:
 
 ```powershell
 python tools/build_item_catalog.py "C:\path\to\CDT_BaseItems.json"
 ```
+
+The command replaces `src/dune_save_editor/data/item_catalog.json`; run the tests and
+include the regenerated catalog in the next release.
 
 ## Development
 
