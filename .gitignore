@@ -37,6 +37,9 @@ pip-wheel-metadata/
 *.key
 *.pem
 
+# Local AI/repository instructions may contain private paths or personal context
+AGENTS.md
+
 # Editor and operating-system files
 .idea/
 .vscode/
