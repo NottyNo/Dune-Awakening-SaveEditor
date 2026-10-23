@@ -1,12 +1,11 @@
 # Dune: Awakening Save Editor
 
-A dark-themed Python GUI for inspecting and editing a Dune: Awakening PC solo save. It
+A Python GUI for inspecting and editing a Dune: Awakening PC solo save. It
 understands the game's eight-byte wrapper, decompresses the zlib payload in memory,
-validates the SQLite database, and writes it back only when you choose **Save**.
+validates the SQLite database, and writes it back.
 
 **Release status:** Alpha v1.0 (`1.0.0a1`). Save-format support is experimental, and no
 prebuilt Windows executable is included yet.
-
 ## Run
 
 Python 3.11 or newer with Tk support is required.
@@ -25,7 +24,7 @@ Close Dune: Awakening before opening or saving `game.db`. The navigation tabs pr
 
 - carried inventory item add, quantity change, and removal;
 - category filtering/sorting and separate Grade 1–5 choices for gradeable items;
-- character health, hydration, heat, spice, Eyes of Ibad, and tech-point values;
+- character health, hydration, heat, spice, Eyes of Ibad, and intel-point values;
 - XP and levels for all five specialization tracks; and
 - Atreides, Harkonnen, and Smuggler reputation points.
 
@@ -35,7 +34,15 @@ editor works in memory until Save is pressed. Saving creates a timestamped backu
 beside the target and refuses to overwrite a file that changed after it was opened.
 
 > This is an experimental editor for an undocumented format. Test restored saves
-> on a copy first. Never commit `game.db` or its backups.
+> on a copy first.
+
+## How to use
+
+1. Open the program
+2. Select your save file by clicking the top left button and choosing the game.db file in the correct save folder
+3. Make your changes
+4. Click Apply (if needed) and Save your changes
+5. Enjoy! :D
 
 ## Item catalog
 
