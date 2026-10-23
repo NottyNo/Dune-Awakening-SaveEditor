@@ -39,8 +39,8 @@ beside the target and refuses to overwrite a file that changed after it was open
 ## How to use
 
 1. Open the program
-2. Select your save file by clicking the top left button and choosing the game.db file in the correct save folder
-Savepath: ```C:\Users\<User>\AppData\Local\DuneSandbox\Saved\Cloud\PlayerClientStorage\FLS_retail\```
+2. Select your save file by clicking the top left button and choosing the game.db file in the correct save folder. \
+**Savepath:** `C:\Users\<User>\AppData\Local\DuneSandbox\Saved\Cloud\PlayerClientStorage\FLS_retail\`
 3. Make your changes
 4. Click Apply (if needed) and Save your changes
 5. Enjoy! :D
