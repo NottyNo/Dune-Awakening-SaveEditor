@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import tkinter as tk
+from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
@@ -25,6 +26,25 @@ DARK_COLORS = {
     "warning": "#E4B65E",
 }
 
+ALL_CATEGORIES = "All categories"
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogChoice:
+    item: CatalogItem
+    quality_level: int = 0
+
+    @property
+    def display_name(self) -> str:
+        if self.quality_level:
+            return f"{self.item.display_name} Grade {self.quality_level}"
+        return self.item.display_name
+
+    @property
+    def search_text(self) -> str:
+        grade = f" grade {self.quality_level}" if self.quality_level else ""
+        return f"{self.item.search_text}{grade}"
+
 
 class SaveEditorApp:
     def __init__(self, root: tk.Tk) -> None:
@@ -40,12 +60,30 @@ class SaveEditorApp:
         self.inventory_rows: dict[str, InventoryItem] = {}
         self.catalog = load_catalog()
         self.catalog_by_id = {item.template_id: item for item in self.catalog}
-        self.catalog_rows: dict[str, CatalogItem] = {}
+        self.catalog_choices = tuple(
+            CatalogChoice(item, quality_level)
+            for item in self.catalog
+            for quality_level in (0, *item.quality_levels)
+        )
+        self.catalog_rows: dict[str, CatalogChoice] = {}
+        self.catalog_categories = (
+            ALL_CATEGORIES,
+            *sorted({item.category for item in self.catalog}, key=str.casefold),
+        )
 
-        self.status_text = tk.StringVar(value=f"Ready — {len(self.catalog):,} catalog items loaded")
+        self.status_text = tk.StringVar(
+            value=(
+                f"Ready — {len(self.catalog_choices):,} item choices from "
+                f"{len(self.catalog):,} unique template IDs"
+            )
+        )
         self.path_text = tk.StringVar(value="No save open")
         self.inventory_search = tk.StringVar()
         self.catalog_search = tk.StringVar()
+        self.catalog_category = tk.StringVar(value=ALL_CATEGORIES)
+        self.catalog_count_text = tk.StringVar()
+        self.catalog_sort_column = "category"
+        self.catalog_sort_reverse = False
         self.quantity = tk.IntVar(value=1)
         self.stat_variables: dict[str, tk.StringVar | tk.BooleanVar] = {}
         self.stat_widgets: dict[str, ttk.Widget] = {}
@@ -151,7 +189,7 @@ class SaveEditorApp:
             "Danger.TButton",
             background=[("pressed", colors["danger"]), ("active", colors["danger_active"])],
         )
-        for widget_style in ("TEntry", "TSpinbox"):
+        for widget_style in ("TEntry", "TSpinbox", "TCombobox"):
             style.configure(
                 widget_style,
                 fieldbackground=colors["field"],
@@ -309,6 +347,13 @@ class SaveEditorApp:
         entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
         self.inventory_search.trace_add("write", lambda *_: self._populate_inventory())
 
+        inv_actions = ttk.Frame(left)
+        inv_actions.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
+        ttk.Button(inv_actions, text="Change Quantity", command=self.edit_quantity).pack(fill=tk.X)
+        ttk.Button(
+            inv_actions, text="Remove", command=self.remove_item, style="Danger.TButton"
+        ).pack(fill=tk.X, pady=(6, 0))
+
         inv_columns = ("slot", "name", "template", "quantity", "quality", "durability")
         self.inventory_tree = ttk.Treeview(left, columns=inv_columns, show="headings")
         headings = {
@@ -316,7 +361,7 @@ class SaveEditorApp:
             "name": ("Name", 170),
             "template": ("Template ID", 150),
             "quantity": ("Qty", 55),
-            "quality": ("Quality", 58),
+            "quality": ("Grade", 58),
             "durability": ("Durability", 75),
         }
         for column, (label, width) in headings.items():
@@ -330,31 +375,60 @@ class SaveEditorApp:
         inv_scroll.pack(side=tk.LEFT, fill=tk.Y)
         self.inventory_tree.bind("<Double-1>", lambda _event: self.edit_quantity())
 
-        inv_actions = ttk.Frame(left)
-        inv_actions.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
-        ttk.Button(inv_actions, text="Change Quantity", command=self.edit_quantity).pack(
-            side=tk.LEFT
-        )
-        ttk.Button(
-            inv_actions, text="Remove", command=self.remove_item, style="Danger.TButton"
-        ).pack(side=tk.LEFT, padx=8)
-
         catalog_filter = ttk.Frame(right)
         catalog_filter.pack(fill=tk.X, pady=(0, 6))
-        ttk.Label(catalog_filter, text="Search:").pack(side=tk.LEFT)
-        catalog_entry = ttk.Entry(catalog_filter, textvariable=self.catalog_search)
+        search_row = ttk.Frame(catalog_filter)
+        search_row.pack(fill=tk.X)
+        ttk.Label(search_row, text="Search:").pack(side=tk.LEFT)
+        catalog_entry = ttk.Entry(search_row, textvariable=self.catalog_search)
         catalog_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
         self.catalog_search.trace_add("write", lambda *_: self._populate_catalog())
 
-        cat_columns = ("name", "template", "category", "stack")
+        category_row = ttk.Frame(catalog_filter)
+        category_row.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(category_row, text="Category:").pack(side=tk.LEFT)
+        category_box = ttk.Combobox(
+            category_row,
+            textvariable=self.catalog_category,
+            values=self.catalog_categories,
+            state="readonly",
+            width=25,
+        )
+        category_box.pack(side=tk.LEFT, padx=(6, 10))
+        category_box.bind("<<ComboboxSelected>>", lambda _event: self._populate_catalog())
+        ttk.Label(category_row, textvariable=self.catalog_count_text, style="Muted.TLabel").pack(
+            side=tk.RIGHT
+        )
+
+        add_actions = ttk.Frame(right)
+        add_actions.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
+        ttk.Label(add_actions, text="Quantity:").pack(anchor=tk.W)
+        ttk.Spinbox(add_actions, from_=1, to=1_000_000, textvariable=self.quantity, width=9).pack(
+            fill=tk.X, pady=(4, 6)
+        )
+        ttk.Button(
+            add_actions,
+            text="Add Selected Item",
+            command=self.add_item,
+            style="Accent.TButton",
+        ).pack(fill=tk.X)
+
+        cat_columns = ("name", "template", "category", "grade", "stack")
         self.catalog_tree = ttk.Treeview(right, columns=cat_columns, show="headings")
+        self.catalog_heading_labels: dict[str, str] = {}
         for column, label, width in (
             ("name", "Name", 190),
             ("template", "Template ID", 170),
-            ("category", "Category", 90),
+            ("category", "Category", 120),
+            ("grade", "Grade", 52),
             ("stack", "Max", 50),
         ):
-            self.catalog_tree.heading(column, text=label)
+            self.catalog_heading_labels[column] = label
+            self.catalog_tree.heading(
+                column,
+                text=label,
+                command=lambda selected=column: self._sort_catalog(selected),
+            )
             self.catalog_tree.column(
                 column, width=width, minwidth=42, stretch=column in {"name", "template"}
             )
@@ -363,19 +437,6 @@ class SaveEditorApp:
         self.catalog_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         cat_scroll.pack(side=tk.LEFT, fill=tk.Y)
         self.catalog_tree.bind("<Double-1>", lambda _event: self.add_item())
-
-        add_actions = ttk.Frame(right)
-        add_actions.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
-        ttk.Label(add_actions, text="Quantity:").pack(side=tk.LEFT)
-        ttk.Spinbox(add_actions, from_=1, to=1_000_000, textvariable=self.quantity, width=9).pack(
-            side=tk.LEFT, padx=(6, 8)
-        )
-        ttk.Button(
-            add_actions,
-            text="Add Selected Item",
-            command=self.add_item,
-            style="Accent.TButton",
-        ).pack(side=tk.LEFT)
 
     def _build_stats_page(self, parent: ttk.Frame) -> None:
         ttk.Label(
@@ -666,31 +727,78 @@ class SaveEditorApp:
             self.catalog_tree.delete(row_id)
         self.catalog_rows.clear()
         needle = self.catalog_search.get().strip().casefold()
-        shown = 0
-        for item in self.catalog:
-            if needle and needle not in item.search_text:
-                continue
+        selected_category = self.catalog_category.get()
+        matches = [
+            choice
+            for choice in self.catalog_choices
+            if (not needle or needle in choice.search_text)
+            and (selected_category == ALL_CATEGORIES or choice.item.category == selected_category)
+        ]
+        key_functions = {
+            "name": lambda choice: (
+                choice.display_name.casefold(),
+                choice.item.template_id.casefold(),
+            ),
+            "template": lambda choice: (
+                choice.item.template_id.casefold(),
+                choice.quality_level,
+            ),
+            "category": lambda choice: (
+                choice.item.category.casefold(),
+                choice.display_name.casefold(),
+            ),
+            "grade": lambda choice: (
+                choice.quality_level,
+                choice.item.display_name.casefold(),
+            ),
+            "stack": lambda choice: (
+                choice.item.max_stack_size,
+                choice.display_name.casefold(),
+            ),
+        }
+        matches.sort(
+            key=key_functions[self.catalog_sort_column],
+            reverse=self.catalog_sort_reverse,
+        )
+        for choice in matches:
+            item = choice.item
             flags = []
-            if item.deprecated:
-                flags.append("deprecated")
+            if item.status != "current":
+                flags.append(item.status)
             if not item.enabled:
                 flags.append("disabled")
             category = item.category + (f" ({', '.join(flags)})" if flags else "")
             row_id = self.catalog_tree.insert(
                 "",
                 tk.END,
-                values=(item.display_name, item.template_id, category, item.max_stack_size),
+                values=(
+                    choice.display_name,
+                    item.template_id,
+                    category,
+                    choice.quality_level or "",
+                    item.max_stack_size,
+                ),
             )
-            self.catalog_rows[row_id] = item
-            shown += 1
-            if shown >= 1000 and not needle:
-                break
+            self.catalog_rows[row_id] = choice
+        self.catalog_count_text.set(f"Showing {len(matches):,}")
+        direction = "▼" if self.catalog_sort_reverse else "▲"
+        for column, label in self.catalog_heading_labels.items():
+            suffix = f" {direction}" if column == self.catalog_sort_column else ""
+            self.catalog_tree.heading(column, text=label + suffix)
+
+    def _sort_catalog(self, column: str) -> None:
+        if column == self.catalog_sort_column:
+            self.catalog_sort_reverse = not self.catalog_sort_reverse
+        else:
+            self.catalog_sort_column = column
+            self.catalog_sort_reverse = False
+        self._populate_catalog()
 
     def _selected_inventory_item(self) -> InventoryItem | None:
         selected = self.inventory_tree.selection()
         return self.inventory_rows.get(selected[0]) if selected else None
 
-    def _selected_catalog_item(self) -> CatalogItem | None:
+    def _selected_catalog_choice(self) -> CatalogChoice | None:
         selected = self.catalog_tree.selection()
         return self.catalog_rows.get(selected[0]) if selected else None
 
@@ -736,10 +844,12 @@ class SaveEditorApp:
         if not self.save or not self.inventory:
             messagebox.showinfo("Open a save", "Open a game.db file first.")
             return
-        item = self._selected_catalog_item()
-        if not item:
+        choice = self._selected_catalog_choice()
+        if not choice:
             messagebox.showinfo("Select an item", "Select an item from the catalog first.")
             return
+        item = choice.item
+        grade = choice.quality_level
         try:
             quantity = int(self.quantity.get())
         except (TypeError, ValueError, tk.TclError):
@@ -753,9 +863,10 @@ class SaveEditorApp:
             return
         if not self._volume_allowed(item.template_id, quantity):
             return
-        if (item.deprecated or not item.enabled) and not messagebox.askyesno(
+        if (item.status != "current" or not item.enabled) and not messagebox.askyesno(
             "Potentially unsafe item",
-            "This catalog entry is disabled or deprecated. Add it anyway?",
+            f"This catalog entry is {item.status}"
+            f"{' and disabled' if not item.enabled else ''}. Add it anyway?",
         ):
             return
         stats = self.save.stats_for_template(item.template_id) or default_item_stats(item)
@@ -765,12 +876,14 @@ class SaveEditorApp:
                 item.template_id,
                 quantity,
                 stats,
+                quality_level=grade,
             )
         except SaveError as exc:
             messagebox.showerror("Could not add item", str(exc))
             return
         self._populate_inventory()
-        self.status_text.set(f"Added {quantity} × {item.display_name} (not saved yet)")
+        grade_text = f", Grade {grade}" if grade else ""
+        self.status_text.set(f"Added {quantity} × {item.display_name}{grade_text} (not saved yet)")
 
     def edit_quantity(self) -> None:
         if not self.save:

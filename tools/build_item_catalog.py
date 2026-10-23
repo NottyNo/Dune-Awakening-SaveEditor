@@ -12,7 +12,14 @@ from dune_save_editor.catalog import catalog_from_fmodel, default_catalog_path, 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build the bundled item catalog from FModel")
-    parser.add_argument("source", type=Path, help="Path to CDT_BaseItems.json")
+    parser.add_argument(
+        "source",
+        type=Path,
+        help=(
+            "Path to the exported Systems/Items directory or CDT_BaseItems.json; "
+            "a sibling Dune/Localization directory is used automatically"
+        ),
+    )
     parser.add_argument("--output", type=Path, default=default_catalog_path())
     args = parser.parse_args()
     items = catalog_from_fmodel(args.source)

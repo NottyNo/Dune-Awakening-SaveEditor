@@ -24,6 +24,7 @@ python -m dune_save_editor
 Close Dune: Awakening before opening or saving `game.db`. The navigation tabs provide:
 
 - carried inventory item add, quantity change, and removal;
+- category filtering/sorting and separate Grade 1–5 choices for gradeable items;
 - character health, hydration, heat, spice, Eyes of Ibad, and tech-point values;
 - XP and levels for all five specialization tracks; and
 - Atreides, Harkonnen, and Smuggler reputation points.
@@ -42,6 +43,17 @@ Users do **not** need FModel or any exported datatables to use the editor. A gen
 catalog is bundled with every source release, so item search and adding items work
 immediately after downloading the repository or a future executable.
 
+The current catalog contains 6,287 unique template IDs gathered from the complete
+`Systems/Items` export. Use the category selector or click a catalog column heading to
+sort the list. Items covered by the game's quality rules appear as separate choices, such
+as `Way of the Misr`, `Way of the Misr Grade 1`, through `Way of the Misr Grade 5`.
+Selecting one of those rows writes its grade to the save's `quality_level` field.
+
+Grade variants are generated only for the item tags listed by the game's
+`DA_StatChangesPerQuality` asset: ranged weapons, melee weapons, assault armor, heavy
+armor, scout armor, stillsuits, and utility clothing. Other templates are not assigned
+grades without source evidence.
+
 When a game patch changes item IDs or item metadata, the bundled catalog must be refreshed
 before those changes can appear in the editor. The project maintainer will update and
 publish the catalog for each relevant patch. Users should update to that release rather
@@ -50,9 +62,17 @@ than extracting the datatables themselves.
 For contributors or maintainers who have a new FModel export, rebuild the catalog with:
 
 ```powershell
-python tools/build_item_catalog.py "C:\path\to\CDT_BaseItems.json"
+python tools/build_item_catalog.py "C:\path\to\DuneSandbox\Content\Dune\Systems\Items"
 ```
 
+The generator merges base item definitions, specialized item-table rows, explicit
+`TemplateId` references, and the game's removal list. IDs are deduplicated
+case-insensitively and are never renamed. When the sibling `Dune/Localization` export is
+present, exact StringTable table/key values take precedence over embedded text. Display
+labels remove development markers such as `PH_` while preserving the original text and
+status for auditing. Entries without usable localization receive only a readable label
+derived from their unchanged ID. Removed and deprecated legacy vehicle rows are not
+presented as released Mk7/Mk8/Mk9 parts or with obsolete rank-based inventory names.
 The command replaces `src/dune_save_editor/data/item_catalog.json`; run the tests and
 include the regenerated catalog in the next release.
 

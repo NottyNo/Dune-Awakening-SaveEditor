@@ -121,6 +121,7 @@ def test_add_edit_remove_and_round_trip(tmp_path):
         "NewItem",
         3,
         '{"FItemStackAndDurabilityStats":[[],{}]}',
+        quality_level=5,
     )
     save.update_stack_size(new_id, 2)
     save.remove_item(900)
@@ -133,6 +134,7 @@ def test_add_edit_remove_and_round_trip(tmp_path):
     assert [(row.template_id, row.stack_size, row.position_index) for row in rows] == [
         ("NewItem", 2, 1)
     ]
+    assert rows[0].quality_level == 5
     reopened.close()
 
 
