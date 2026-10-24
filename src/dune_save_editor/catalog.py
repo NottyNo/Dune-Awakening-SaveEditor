@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 LocalizationMap = dict[tuple[str, str], str]
+NON_INVENTORY_CATEGORIES = frozenset({"abilities", "gadgets", "vehicle abilities"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +43,14 @@ class CatalogItem:
         return " ".join(
             (self.template_id, self.display_name, self.source_name, self.category, *self.tags)
         ).casefold()
+
+
+def is_inventory_catalog_item(item: CatalogItem) -> bool:
+    """Exclude skill and vehicle abilities that cannot exist as inventory items."""
+
+    return item.category.casefold() not in NON_INVENTORY_CATEGORIES and not any(
+        tag.casefold().startswith("items.abilities") for tag in item.tags
+    )
 
 
 def _localized_text(
@@ -484,11 +493,12 @@ def _directory_catalog(source: Path) -> list[CatalogItem]:
 def catalog_from_fmodel(source: Path) -> list[CatalogItem]:
     """Build a deduplicated catalog from an Items export directory or base table."""
     if source.is_dir():
-        return _directory_catalog(source)
-    return sorted(
+        return [item for item in _directory_catalog(source) if is_inventory_catalog_item(item)]
+    items = sorted(
         _catalog_from_base_table(source),
         key=lambda item: (item.display_name.casefold(), item.template_id.casefold()),
     )
+    return [item for item in items if is_inventory_catalog_item(item)]
 
 
 def write_catalog(items: list[CatalogItem], destination: Path) -> None:
@@ -502,6 +512,7 @@ def write_catalog(items: list[CatalogItem], destination: Path) -> None:
                 "quality_levels": list(item.quality_levels),
             }
             for item in items
+            if is_inventory_catalog_item(item)
         ],
     }
     destination.write_text(
@@ -522,7 +533,7 @@ def load_catalog(path: Path | None = None) -> list[CatalogItem]:
         payload.get("items"), list
     ):
         raise ValueError(f"Unsupported item catalog format: {source}")
-    return [
+    items = [
         CatalogItem(
             template_id=str(row["template_id"]),
             display_name=str(row["display_name"]),
@@ -545,6 +556,7 @@ def load_catalog(path: Path | None = None) -> list[CatalogItem]:
         )
         for row in payload["items"]
     ]
+    return [item for item in items if is_inventory_catalog_item(item)]
 
 
 def default_item_stats(item: CatalogItem) -> str:

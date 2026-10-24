@@ -5,6 +5,7 @@ import pytest
 
 from dune_save_editor.save_file import (
     DuneSave,
+    InventoryError,
     SaveChangedError,
     SaveFormatError,
     pack_save,
@@ -22,7 +23,16 @@ def make_save(path):
             last_login_time INTEGER
         ) STRICT;
         CREATE TABLE actors (
-            id INTEGER PRIMARY KEY, properties BLOB, gas_attributes BLOB
+            id INTEGER PRIMARY KEY, class TEXT, properties BLOB, gas_attributes BLOB
+        ) STRICT;
+        CREATE TABLE vehicles (id INTEGER PRIMARY KEY) STRICT;
+        CREATE TABLE permission_actor (
+            actor_id INTEGER PRIMARY KEY, actor_name TEXT
+        ) STRICT;
+        CREATE TABLE permission_actor_rank (
+            permission_actor_id INTEGER NOT NULL, player_id INTEGER NOT NULL,
+            rank INTEGER NOT NULL,
+            PRIMARY KEY (permission_actor_id, player_id)
         ) STRICT;
         CREATE TABLE inventories (
             id INTEGER PRIMARY KEY AUTOINCREMENT, actor_id INTEGER,
@@ -57,11 +67,19 @@ def make_save(path):
             (4, 'Smuggler');
         INSERT INTO inventories (id, actor_id, inventory_type, max_item_count)
             VALUES (20, 11, 0, 3);
+        INSERT INTO vehicles VALUES (30), (31);
+        INSERT INTO permission_actor VALUES
+            (30, '##BuggyChoam'), (31, '##CarrierOrnithopter');
+        INSERT INTO permission_actor_rank VALUES (30, 10, 2), (31, 10, 2);
+        INSERT INTO inventories
+            (id, actor_id, inventory_type, max_item_count, max_item_volume)
+            VALUES (21, 30, 0, 2, 500.0), (22, 31, 0, 10, 500.0);
         INSERT INTO items_id_sequencer VALUES (1000);
         INSERT INTO items (
             id, inventory_id, stack_size, position_index, template_id, stats, quality_level
         ) VALUES (900, 20, 2, 0, 'ExistingItem',
-            '{"FItemStackAndDurabilityStats":[[],{}]}', 0);
+            '{"FItemStackAndDurabilityStats":[[],{
+                "CurrentDurability":75.0,"DecayedMaxDurability":100.0}]}', 0);
         """
     )
     pawn_properties = """{
@@ -92,12 +110,19 @@ def make_save(path):
     }"""
     controller_properties = '{"BP_JourneyComponent_C":{"CurrentSpiceExposureThresholdLevel":1}}'
     db.execute(
-        "INSERT INTO actors VALUES (11, jsonb(?), jsonb(?))",
+        "INSERT INTO actors (id, class, properties, gas_attributes) "
+        "VALUES (11, 'BP_DunePlayerCharacter_C', jsonb(?), jsonb(?))",
         (pawn_properties, gas_attributes),
     )
     db.execute(
-        "INSERT INTO actors VALUES (10, jsonb(?), jsonb('{}'))",
+        "INSERT INTO actors (id, class, properties, gas_attributes) "
+        "VALUES (10, 'BP_DunePlayerController_C', jsonb(?), jsonb('{}'))",
         (controller_properties,),
+    )
+    db.execute(
+        "INSERT INTO actors (id, class, properties, gas_attributes) "
+        "VALUES (30, '/Game/Vehicles/BP_Buggy_CHOAM_C', jsonb('{}'), jsonb('{}')), "
+        "(31, '/Game/Vehicles/BP_OrnithopterTransport_C', jsonb('{}'), jsonb('{}'))"
     )
     path.write_bytes(pack_save(db.serialize()))
     db.close()
@@ -138,6 +163,55 @@ def test_add_edit_remove_and_round_trip(tmp_path):
     reopened.close()
 
 
+def test_owned_vehicle_inventory_is_editable_and_carrier_is_hidden(tmp_path):
+    source = tmp_path / "game.db"
+    output = tmp_path / "edited.db"
+    make_save(source)
+    save = DuneSave.open(source)
+
+    inventories = save.vehicle_inventories(1)
+    assert len(inventories) == 1
+    assert inventories[0].owner_kind == "Buggy"
+    assert inventories[0].owner_id == 30
+    assert inventories[0].max_item_count == 2
+    new_id = save.add_item(
+        inventories[0].inventory_id,
+        "VehicleCargo",
+        4,
+        '{"FItemStackAndDurabilityStats":[[],{}]}',
+    )
+    assert save.save(output) is None
+    save.close()
+
+    reopened = DuneSave.open(output)
+    assert [(item.item_id, item.template_id) for item in reopened.inventory_items(21)] == [
+        (new_id, "VehicleCargo")
+    ]
+    reopened.close()
+
+
+def test_edit_item_durability_and_round_trip(tmp_path):
+    source = tmp_path / "game.db"
+    output = tmp_path / "edited.db"
+    make_save(source)
+    save = DuneSave.open(source)
+
+    item = save.inventory_items(20)[0]
+    assert item.durability == 75.0
+    assert item.stored_max_durability == 100.0
+    with pytest.raises(InventoryError):
+        save.update_item_durability(item.item_id, 101.0, 100.0)
+    save.update_item_durability(item.item_id, 62.5, 100.0)
+    assert save.save(output) is None
+    save.close()
+
+    reopened = DuneSave.open(output)
+    edited = reopened.inventory_items(20)[0]
+    assert edited.durability == 62.5
+    assert edited.stored_max_durability == 100.0
+    reopened.close()
+
+
 def test_save_creates_backup_and_detects_external_change(tmp_path):
     source = tmp_path / "game.db"
     make_save(source)
@@ -148,6 +222,9 @@ def test_save_creates_backup_and_detects_external_change(tmp_path):
     backup = save.save()
 
     assert backup is not None and backup.exists()
+    assert backup.parent == source.parent / "Save Editor Backups"
+    assert backup.name.startswith("game.db.backup-")
+    assert not list(source.parent.glob("game.db.backup-*"))
     assert hashlib.sha256(backup.read_bytes()).digest() == original_digest
 
     source.write_bytes(source.read_bytes() + b"changed")

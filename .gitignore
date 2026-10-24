@@ -61,5 +61,6 @@ Desktop.ini
 *.sqlite3
 saves/
 backups/
+Save Editor Backups/
 exports/
 local-data/

@@ -56,6 +56,7 @@ class Inventory:
     max_item_count: int | None
     max_item_volume: float | None
     owner_kind: str
+    owner_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,16 +68,23 @@ class InventoryItem:
     quality_level: int
     stats: str
 
-    @property
-    def durability(self) -> float | None:
+    def _durability_value(self, key: str) -> float | None:
         try:
             payload = json.loads(self.stats)
             values = payload.get("FItemStackAndDurabilityStats", [])
             details = values[1] if isinstance(values, list) and len(values) > 1 else {}
-            value = details.get("CurrentDurability") if isinstance(details, dict) else None
+            value = details.get(key) if isinstance(details, dict) else None
             return float(value) if value is not None else None
         except (TypeError, ValueError, json.JSONDecodeError):
             return None
+
+    @property
+    def durability(self) -> float | None:
+        return self._durability_value("CurrentDurability")
+
+    @property
+    def stored_max_durability(self) -> float | None:
+        return self._durability_value("DecayedMaxDurability")
 
 
 @dataclass(frozen=True, slots=True)
@@ -385,7 +393,9 @@ class DuneSave:
         rows = self._db.execute(
             """
             SELECT inv.id, inv.inventory_type, inv.max_item_count, inv.max_item_volume,
-                   CASE WHEN inv.actor_id = ps.player_pawn_id THEN 'Character' ELSE 'Controller' END
+                   CASE WHEN inv.actor_id = ps.player_pawn_id
+                        THEN 'Character' ELSE 'Controller' END,
+                   inv.actor_id
             FROM player_state AS ps
             JOIN inventories AS inv
               ON inv.actor_id IN (ps.player_pawn_id, ps.player_controller_id)
@@ -401,9 +411,98 @@ class DuneSave:
                 max_item_count=None if row[2] is None else int(row[2]),
                 max_item_volume=None if row[3] is None else float(row[3]),
                 owner_kind=str(row[4]),
+                owner_id=int(row[5]),
             )
             for row in rows
         ]
+
+    def _table_has_columns(self, table: str, columns: set[str]) -> bool:
+        exists = self._db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+        ).fetchone()
+        if not exists:
+            return False
+        present = {str(row[1]) for row in self._db.execute(f'PRAGMA table_info("{table}")')}
+        return columns <= present
+
+    @staticmethod
+    def _vehicle_name(actor_class: str, actor_name: str) -> str:
+        combined = f"{actor_class} {actor_name}".casefold()
+        known_names = (
+            (("ornithoptertransport", "carrierornithopter"), "Carrier Ornithopter"),
+            (("ornithoptermedium",), "Assault Ornithopter"),
+            (("ornithopterlight",), "Scout Ornithopter"),
+            (("sandbike", "onemangroundcar"), "Sandbike"),
+            (("buggy",), "Buggy"),
+        )
+        for markers, label in known_names:
+            if any(marker in combined for marker in markers):
+                return label
+        source = actor_name.strip("#") or actor_class.rsplit("/", 1)[-1]
+        source = source.removeprefix("BP_").removesuffix("_C")
+        words: list[str] = []
+        current = ""
+        for character in source.replace("_", " "):
+            if current and character.isupper() and current[-1].islower():
+                words.append(current)
+                current = character
+            elif character == " ":
+                if current:
+                    words.append(current)
+                    current = ""
+            else:
+                current += character
+        if current:
+            words.append(current)
+        return " ".join(words) or "Vehicle"
+
+    def vehicle_inventories(self, player_row_id: int) -> list[Inventory]:
+        """Return usable storage inventories belonging to the selected player's vehicles."""
+        required = {
+            "vehicles": {"id"},
+            "permission_actor_rank": {"permission_actor_id", "player_id"},
+            "permission_actor": {"actor_id", "actor_name"},
+            "actors": {"id", "class"},
+        }
+        if any(not self._table_has_columns(table, columns) for table, columns in required.items()):
+            return []
+
+        actor_ids = self._player_actor_ids(player_row_id)
+        possible_player_ids = sorted({player_row_id, *actor_ids.values()})
+        placeholders = ", ".join("?" for _ in possible_player_ids)
+        rows = self._db.execute(
+            f"""
+            SELECT DISTINCT inv.id, inv.inventory_type, inv.max_item_count,
+                   inv.max_item_volume, v.id, coalesce(a.class, ''),
+                   coalesce(pa.actor_name, '')
+            FROM permission_actor_rank AS rank
+            JOIN vehicles AS v ON v.id = rank.permission_actor_id
+            JOIN actors AS a ON a.id = v.id
+            JOIN inventories AS inv ON inv.actor_id = v.id
+            LEFT JOIN permission_actor AS pa ON pa.actor_id = v.id
+            WHERE rank.player_id IN ({placeholders})
+              AND inv.inventory_type = 0
+              AND coalesce(inv.max_item_count, 0) > 0
+            ORDER BY v.id, inv.id
+            """,
+            possible_player_ids,
+        ).fetchall()
+        inventories: list[Inventory] = []
+        for row in rows:
+            owner_kind = self._vehicle_name(str(row[5]), str(row[6]))
+            if owner_kind == "Carrier Ornithopter":
+                continue
+            inventories.append(
+                Inventory(
+                    inventory_id=int(row[0]),
+                    inventory_type=int(row[1]),
+                    max_item_count=int(row[2]),
+                    max_item_volume=None if row[3] is None else float(row[3]),
+                    owner_kind=owner_kind,
+                    owner_id=int(row[4]),
+                )
+            )
+        return inventories
 
     def inventory_items(self, inventory_id: int) -> list[InventoryItem]:
         rows = self._db.execute(
@@ -440,7 +539,7 @@ class DuneSave:
         if not row:
             raise InventoryError("Inventory no longer exists")
         if row[1] != 0:
-            raise InventoryError("This release only edits carried inventory (type 0)")
+            raise InventoryError("Only item-storage inventories (type 0) can be edited")
         return (None if row[0] is None else int(row[0]), int(row[1]))
 
     def add_item(
@@ -473,7 +572,7 @@ class DuneSave:
         if max_count is not None and max_count >= 0:
             position = next((slot for slot in range(max_count) if slot not in occupied), None)
             if position is None:
-                raise InventoryError("The carried inventory has no free slot")
+                raise InventoryError("The selected inventory has no free slot")
         else:
             position = max(occupied, default=-1) + 1
 
@@ -513,6 +612,38 @@ class DuneSave:
                 "UPDATE items SET stack_size = ? WHERE id = ?",
                 (stack_size, item_id),
             )
+        if cursor.rowcount != 1:
+            raise InventoryError("Item no longer exists")
+        self.dirty = True
+
+    def update_item_durability(
+        self, item_id: int, current_durability: float, maximum_durability: float
+    ) -> None:
+        if isinstance(current_durability, bool) or isinstance(maximum_durability, bool):
+            raise InventoryError("Durability must be numeric")
+        current = float(current_durability)
+        maximum = float(maximum_durability)
+        if not math.isfinite(current) or not math.isfinite(maximum):
+            raise InventoryError("Durability must be finite")
+        if maximum <= 0:
+            raise InventoryError("This item does not have editable durability")
+        if current < 0 or current > maximum:
+            raise InventoryError(f"Durability must be between 0 and {maximum:g}")
+
+        row = self._db.execute("SELECT json(stats) FROM items WHERE id = ?", (item_id,)).fetchone()
+        if not row:
+            raise InventoryError("Item no longer exists")
+        try:
+            payload = json.loads(row[0])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise InventoryError("Item durability data is invalid") from exc
+        values = payload.get("FItemStackAndDurabilityStats")
+        if not isinstance(values, list) or len(values) < 2 or not isinstance(values[1], dict):
+            raise InventoryError("This item does not store editable durability data")
+        values[1]["CurrentDurability"] = current
+        encoded = json.dumps(payload, separators=(",", ":"))
+        with self._db:
+            cursor = self._db.execute("UPDATE items SET stats = ? WHERE id = ?", (encoded, item_id))
         if cursor.rowcount != 1:
             raise InventoryError("Item no longer exists")
         self.dirty = True
@@ -564,7 +695,9 @@ class DuneSave:
         backup: Path | None = None
         if target.exists():
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-            backup = target.with_name(f"{target.name}.backup-{stamp}")
+            backup_directory = target.parent / "Save Editor Backups"
+            backup_directory.mkdir(parents=True, exist_ok=True)
+            backup = backup_directory / f"{target.name}.backup-{stamp}"
             shutil.copy2(target, backup)
 
         temporary: Path | None = None

@@ -161,6 +161,61 @@ def test_catalog_directory_merges_sources_and_deduplicates_ids(tmp_path):
     assert sum(item.template_id.casefold() == "spicefiber" for item in items) == 1
 
 
+def test_catalog_excludes_ability_and_gadget_definitions(tmp_path):
+    items_dir = tmp_path / "Items"
+    base_dir = items_dir / "BaseItems"
+    base_dir.mkdir(parents=True)
+    base_rows = {
+        "D_TestGadget": {
+            "StaticData": {"Name": {"LocalizedString": "Test Gadget"}},
+        },
+        "SpiceFiber": {
+            "StaticData": {
+                "Name": {"LocalizedString": "Spice Fiber"},
+                "ItemTags": ["Items.Resources"],
+            },
+        },
+    }
+    base_table = {
+        "Properties": {"RowStruct": {"ObjectName": "Class'BaseItemTableRow'"}},
+        "Rows": base_rows,
+    }
+    (items_dir / "CDT_BaseItems.json").write_text(json.dumps(base_table), encoding="utf-8")
+    (base_dir / "DT_BaseItems_Gadgets.json").write_text(
+        json.dumps({**base_table, "Rows": {"D_TestGadget": base_rows["D_TestGadget"]}}),
+        encoding="utf-8",
+    )
+    (base_dir / "DT_BaseItems_Resources.json").write_text(
+        json.dumps({**base_table, "Rows": {"SpiceFiber": base_rows["SpiceFiber"]}}),
+        encoding="utf-8",
+    )
+    (items_dir / "DT_ItemTableAbilities.json").write_text(
+        json.dumps(
+            {
+                "Properties": {"RowStruct": {"ObjectName": "Class'AbilityItemTableRow'"}},
+                "Rows": {"TestAbility": {}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (items_dir / "DT_ItemTableVehicleAbilities.json").write_text(
+        json.dumps(
+            {
+                "Properties": {"RowStruct": {"ObjectName": "Class'VehicleAbilityItemTableRow'"}},
+                "Rows": {"TestVehicleAbility": {}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    items = catalog_from_fmodel(items_dir)
+
+    assert [item.template_id for item in items] == ["SpiceFiber"]
+    assert {item.category for item in items}.isdisjoint(
+        {"Abilities", "Gadgets", "Vehicle Abilities"}
+    )
+
+
 def test_catalog_cleans_placeholder_marker_but_keeps_source_name(tmp_path):
     source = tmp_path / "CDT_BaseItems.json"
     source.write_text(

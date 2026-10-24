@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import os
+import queue
+import threading
 import tkinter as tk
+import webbrowser
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
+from dune_save_editor import __version__
 from dune_save_editor.catalog import CatalogItem, default_item_stats, load_catalog
 from dune_save_editor.save_file import DuneSave, Inventory, InventoryItem, SaveError
 from dune_save_editor.stats import CHARACTER_STATS, SPECIALIZATION_TRACKS
+from dune_save_editor.update_check import RELEASES_PAGE_URL, ReleaseInfo, check_for_update
 
 DARK_COLORS = {
     "background": "#111419",
@@ -26,7 +32,99 @@ DARK_COLORS = {
     "warning": "#E4B65E",
 }
 
+ASSET_DIRECTORY = Path(__file__).with_name("assets")
 ALL_CATEGORIES = "All categories"
+CATALOG_COLUMN_DEFINITIONS = (
+    ("name", "Name", 190),
+    ("template", "Template ID", 170),
+    ("category", "Category", 120),
+    ("grade", "Grade", 52),
+    ("stack", "Max Stack", 70),
+    ("weight", "Weight", 65),
+)
+INVENTORY_COLUMN_DEFINITIONS = (
+    ("slot", "Slot", 48),
+    ("name", "Name", 170),
+    ("template", "Template ID", 150),
+    ("category", "Category", 105),
+    ("quantity", "Qty", 55),
+    ("quality", "Grade", 58),
+    ("durability", "Durability (Current/Max)", 145),
+    ("weight", "Unit Weight", 78),
+    ("total_weight", "Stack Weight", 85),
+)
+
+
+def _display_number(value: float) -> str:
+    return f"{value:,.2f}".rstrip("0").rstrip(".")
+
+
+def catalog_item_for_template(
+    catalog_by_id: Mapping[str, CatalogItem], template_id: str
+) -> CatalogItem | None:
+    """Find catalog metadata without assuming save-file identifier capitalization."""
+
+    return catalog_by_id.get(template_id) or catalog_by_id.get(template_id.casefold())
+
+
+def inventory_weight_summary(
+    inventory: Inventory,
+    records: Iterable[InventoryItem],
+    catalog_by_id: Mapping[str, CatalogItem],
+) -> str:
+    known_weight = 0.0
+    unknown_stacks = 0
+    for record in records:
+        item = catalog_item_for_template(catalog_by_id, record.template_id)
+        if item is None:
+            unknown_stacks += 1
+        else:
+            known_weight += item.item_size * record.stack_size
+
+    if inventory.max_item_volume is None:
+        maximum = "not stored"
+    elif inventory.max_item_volume < 0:
+        maximum = "unlimited"
+    else:
+        maximum = _display_number(inventory.max_item_volume)
+    load_kind = "Known load" if unknown_stacks else "Estimated load"
+    unknown = f" (+{unknown_stacks} unlisted stacks)" if unknown_stacks else ""
+    return (
+        f"Max inventory weight: {maximum}  •  {load_kind}: {_display_number(known_weight)}{unknown}"
+    )
+
+
+def visible_catalog_columns(selections: Mapping[str, bool]) -> tuple[str, ...]:
+    return tuple(
+        column for column, _label, _width in CATALOG_COLUMN_DEFINITIONS if selections.get(column)
+    )
+
+
+def visible_inventory_columns(selections: Mapping[str, bool]) -> tuple[str, ...]:
+    return tuple(
+        column for column, _label, _width in INVENTORY_COLUMN_DEFINITIONS if selections.get(column)
+    )
+
+
+def effective_max_durability(
+    record: InventoryItem, catalog_item: CatalogItem | None
+) -> float | None:
+    stored = record.stored_max_durability
+    if stored is not None and stored > 0:
+        return stored
+    if catalog_item is not None and catalog_item.max_durability > 0:
+        return catalog_item.max_durability
+    return None
+
+
+def durability_summary(record: InventoryItem, catalog_item: CatalogItem | None) -> str:
+    current = record.durability
+    maximum = effective_max_durability(record, catalog_item)
+    if current is None and maximum is None:
+        return ""
+    current_text = "—" if current is None else _display_number(current)
+    maximum_text = "?" if maximum is None else _display_number(maximum)
+    return f"{current_text}/{maximum_text}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,17 +147,22 @@ class CatalogChoice:
 class SaveEditorApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("Dune: Awakening Save Editor")
+        self.root.title(f"Dune: Awakening Save Editor — v{__version__}")
         self.root.geometry("1220x760")
         self.root.minsize(980, 620)
         self._configure_theme()
+        self.app_icon_image: tk.PhotoImage | None = None
+        self.toolbar_logo_image: tk.PhotoImage | None = None
+        self._load_brand_assets()
 
         self.save: DuneSave | None = None
         self.player_row_id: int | None = None
         self.inventory: Inventory | None = None
+        self.inventories: list[Inventory] = []
+        self.inventory_choices: dict[str, Inventory] = {}
         self.inventory_rows: dict[str, InventoryItem] = {}
         self.catalog = load_catalog()
-        self.catalog_by_id = {item.template_id: item for item in self.catalog}
+        self.catalog_by_id = {item.template_id.casefold(): item for item in self.catalog}
         self.catalog_choices = tuple(
             CatalogChoice(item, quality_level)
             for item in self.catalog
@@ -79,9 +182,19 @@ class SaveEditorApp:
         )
         self.path_text = tk.StringVar(value="No save open")
         self.inventory_search = tk.StringVar()
+        self.inventory_choice = tk.StringVar()
+        self.inventory_weight_text = tk.StringVar(value="Max inventory weight: —")
+        self.inventory_column_variables = {
+            column: tk.BooleanVar(value=True)
+            for column, _label, _width in INVENTORY_COLUMN_DEFINITIONS
+        }
         self.catalog_search = tk.StringVar()
         self.catalog_category = tk.StringVar(value=ALL_CATEGORIES)
         self.catalog_count_text = tk.StringVar()
+        self.catalog_column_variables = {
+            column: tk.BooleanVar(value=True)
+            for column, _label, _width in CATALOG_COLUMN_DEFINITIONS
+        }
         self.catalog_sort_column = "category"
         self.catalog_sort_reverse = False
         self.quantity = tk.IntVar(value=1)
@@ -90,10 +203,37 @@ class SaveEditorApp:
         self.available_stat_keys: set[str] = set()
         self.specialization_variables: dict[int, tuple[tk.StringVar, tk.StringVar]] = {}
         self.faction_variables: dict[int, tk.StringVar] = {}
+        self._update_results: queue.SimpleQueue[ReleaseInfo | None] = queue.SimpleQueue()
 
         self._build_ui()
         self._populate_catalog()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.after(300, self._start_update_check)
+
+    def _load_brand_assets(self) -> None:
+        try:
+            self.app_icon_image = tk.PhotoImage(
+                master=self.root,
+                file=str(ASSET_DIRECTORY / "app_icon.png"),
+            )
+            self.root.iconphoto(True, self.app_icon_image)
+        except tk.TclError:
+            self.app_icon_image = None
+
+        if os.name == "nt":
+            try:
+                self.root.iconbitmap(str(ASSET_DIRECTORY / "app_icon.ico"))
+            except tk.TclError:
+                pass
+
+        try:
+            logo = tk.PhotoImage(
+                master=self.root,
+                file=str(ASSET_DIRECTORY / "app_logo.png"),
+            )
+            self.toolbar_logo_image = logo.subsample(8, 8)
+        except tk.TclError:
+            self.toolbar_logo_image = None
 
     def _configure_theme(self) -> None:
         colors = DARK_COLORS
@@ -271,19 +411,25 @@ class SaveEditorApp:
                 ("!selected", colors["field"]),
             ],
         )
-        style.configure(
-            "Vertical.TScrollbar",
-            background=colors["surface_raised"],
-            troughcolor=colors["field"],
-            bordercolor=colors["background"],
-            arrowcolor=colors["muted"],
-        )
-        style.map("Vertical.TScrollbar", background=[("active", colors["border"])])
+        for scrollbar_style in ("Vertical.TScrollbar", "Horizontal.TScrollbar"):
+            style.configure(
+                scrollbar_style,
+                background=colors["surface_raised"],
+                troughcolor=colors["field"],
+                bordercolor=colors["background"],
+                arrowcolor=colors["muted"],
+            )
+            style.map(scrollbar_style, background=[("active", colors["border"])])
         style.configure("TPanedwindow", background=colors["background"], sashrelief=tk.FLAT)
 
     def _build_ui(self) -> None:
         toolbar = ttk.Frame(self.root, padding=(10, 10, 10, 6))
         toolbar.pack(fill=tk.X)
+        if self.toolbar_logo_image is not None:
+            ttk.Label(toolbar, image=self.toolbar_logo_image).pack(
+                side=tk.LEFT,
+                padx=(0, 10),
+            )
         ttk.Button(toolbar, text="Open game.db", command=self.open_save).pack(side=tk.LEFT)
         self.save_button = ttk.Button(
             toolbar,
@@ -294,6 +440,11 @@ class SaveEditorApp:
         )
         self.save_button.pack(side=tk.LEFT, padx=(8, 0))
         ttk.Label(toolbar, textvariable=self.path_text).pack(side=tk.LEFT, padx=14)
+        ttk.Label(
+            toolbar,
+            text=f"Version {__version__}",
+            style="Muted.TLabel",
+        ).pack(side=tk.RIGHT, padx=(14, 0))
 
         notice = ttk.Label(
             self.root,
@@ -313,7 +464,7 @@ class SaveEditorApp:
         stats_page = ttk.Frame(self.navigation, padding=12)
         specializations_page = ttk.Frame(self.navigation, padding=12)
         factions_page = ttk.Frame(self.navigation, padding=12)
-        self.navigation.add(inventory_page, text="Inventory")
+        self.navigation.add(inventory_page, text="Inventories")
         self.navigation.add(stats_page, text="Character Statistics")
         self.navigation.add(specializations_page, text="Specializations & Level")
         self.navigation.add(factions_page, text="Faction Reputation")
@@ -333,9 +484,26 @@ class SaveEditorApp:
         status.pack(fill=tk.X, side=tk.BOTTOM)
 
     def _build_inventory_page(self, parent: ttk.Frame) -> None:
+        selector = ttk.Frame(parent, padding=(0, 8, 0, 8))
+        selector.pack(fill=tk.X)
+        ttk.Label(selector, text="Edit inventory:").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(
+            selector,
+            textvariable=self.inventory_weight_text,
+            style="Muted.TLabel",
+        ).pack(side=tk.RIGHT, padx=(8, 8))
+        self.inventory_selector = ttk.Combobox(
+            selector,
+            textvariable=self.inventory_choice,
+            state=tk.DISABLED,
+            width=48,
+        )
+        self.inventory_selector.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 8))
+        self.inventory_selector.bind("<<ComboboxSelected>>", self._select_inventory)
+
         panes = ttk.Panedwindow(parent, orient=tk.HORIZONTAL)
         panes.pack(fill=tk.BOTH, expand=True)
-        left = ttk.Labelframe(panes, text="Carried Inventory", padding=8)
+        left = ttk.Labelframe(panes, text="Selected Inventory", padding=8)
         right = ttk.Labelframe(panes, text="Item Catalog", padding=8)
         panes.add(left, weight=1)
         panes.add(right, weight=1)
@@ -343,6 +511,24 @@ class SaveEditorApp:
         inventory_filter = ttk.Frame(left)
         inventory_filter.pack(fill=tk.X, pady=(0, 6))
         ttk.Label(inventory_filter, text="Filter:").pack(side=tk.LEFT)
+        self.inventory_columns_button = ttk.Menubutton(inventory_filter, text="Columns")
+        self.inventory_columns_button.pack(side=tk.RIGHT, padx=(8, 0))
+        self.inventory_columns_menu = tk.Menu(
+            self.inventory_columns_button,
+            tearoff=False,
+            background=DARK_COLORS["surface_raised"],
+            foreground=DARK_COLORS["text"],
+            activebackground=DARK_COLORS["accent_dark"],
+            activeforeground=DARK_COLORS["text"],
+            selectcolor=DARK_COLORS["field"],
+        )
+        for column, label, _width in INVENTORY_COLUMN_DEFINITIONS:
+            self.inventory_columns_menu.add_checkbutton(
+                label=label,
+                variable=self.inventory_column_variables[column],
+                command=self._apply_inventory_columns,
+            )
+        self.inventory_columns_button.configure(menu=self.inventory_columns_menu)
         entry = ttk.Entry(inventory_filter, textvariable=self.inventory_search)
         entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
         self.inventory_search.trace_add("write", lambda *_: self._populate_inventory())
@@ -350,30 +536,37 @@ class SaveEditorApp:
         inv_actions = ttk.Frame(left)
         inv_actions.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
         ttk.Button(inv_actions, text="Change Quantity", command=self.edit_quantity).pack(fill=tk.X)
+        ttk.Button(inv_actions, text="Change Durability", command=self.edit_durability).pack(
+            fill=tk.X, pady=(6, 0)
+        )
         ttk.Button(
             inv_actions, text="Remove", command=self.remove_item, style="Danger.TButton"
         ).pack(fill=tk.X, pady=(6, 0))
 
-        inv_columns = ("slot", "name", "template", "quantity", "quality", "durability")
-        self.inventory_tree = ttk.Treeview(left, columns=inv_columns, show="headings")
-        headings = {
-            "slot": ("Slot", 48),
-            "name": ("Name", 170),
-            "template": ("Template ID", 150),
-            "quantity": ("Qty", 55),
-            "quality": ("Grade", 58),
-            "durability": ("Durability", 75),
-        }
-        for column, (label, width) in headings.items():
+        inv_columns = tuple(column for column, _label, _width in INVENTORY_COLUMN_DEFINITIONS)
+        inventory_table = ttk.Frame(left)
+        inventory_table.pack(fill=tk.BOTH, expand=True)
+        inventory_table.columnconfigure(0, weight=1)
+        inventory_table.rowconfigure(0, weight=1)
+        self.inventory_tree = ttk.Treeview(inventory_table, columns=inv_columns, show="headings")
+        for column, label, width in INVENTORY_COLUMN_DEFINITIONS:
             self.inventory_tree.heading(column, text=label)
-            self.inventory_tree.column(
-                column, width=width, minwidth=42, stretch=column in {"name", "template"}
-            )
-        inv_scroll = ttk.Scrollbar(left, orient=tk.VERTICAL, command=self.inventory_tree.yview)
-        self.inventory_tree.configure(yscrollcommand=inv_scroll.set)
-        self.inventory_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        inv_scroll.pack(side=tk.LEFT, fill=tk.Y)
+            self.inventory_tree.column(column, width=width, minwidth=width, stretch=False)
+        inv_vertical_scroll = ttk.Scrollbar(
+            inventory_table, orient=tk.VERTICAL, command=self.inventory_tree.yview
+        )
+        self.inventory_horizontal_scroll = ttk.Scrollbar(
+            inventory_table, orient=tk.HORIZONTAL, command=self.inventory_tree.xview
+        )
+        self.inventory_tree.configure(
+            yscrollcommand=inv_vertical_scroll.set,
+            xscrollcommand=self.inventory_horizontal_scroll.set,
+        )
+        self.inventory_tree.grid(row=0, column=0, sticky="nsew")
+        inv_vertical_scroll.grid(row=0, column=1, sticky="ns")
+        self.inventory_horizontal_scroll.grid(row=1, column=0, sticky="ew")
         self.inventory_tree.bind("<Double-1>", lambda _event: self.edit_quantity())
+        self._apply_inventory_columns()
 
         catalog_filter = ttk.Frame(right)
         catalog_filter.pack(fill=tk.X, pady=(0, 6))
@@ -396,6 +589,24 @@ class SaveEditorApp:
         )
         category_box.pack(side=tk.LEFT, padx=(6, 10))
         category_box.bind("<<ComboboxSelected>>", lambda _event: self._populate_catalog())
+        self.catalog_columns_button = ttk.Menubutton(category_row, text="Columns")
+        self.catalog_columns_button.pack(side=tk.LEFT)
+        self.catalog_columns_menu = tk.Menu(
+            self.catalog_columns_button,
+            tearoff=False,
+            background=DARK_COLORS["surface_raised"],
+            foreground=DARK_COLORS["text"],
+            activebackground=DARK_COLORS["accent_dark"],
+            activeforeground=DARK_COLORS["text"],
+            selectcolor=DARK_COLORS["field"],
+        )
+        for column, label, _width in CATALOG_COLUMN_DEFINITIONS:
+            self.catalog_columns_menu.add_checkbutton(
+                label=label,
+                variable=self.catalog_column_variables[column],
+                command=self._apply_catalog_columns,
+            )
+        self.catalog_columns_button.configure(menu=self.catalog_columns_menu)
         ttk.Label(category_row, textvariable=self.catalog_count_text, style="Muted.TLabel").pack(
             side=tk.RIGHT
         )
@@ -413,30 +624,56 @@ class SaveEditorApp:
             style="Accent.TButton",
         ).pack(fill=tk.X)
 
-        cat_columns = ("name", "template", "category", "grade", "stack")
-        self.catalog_tree = ttk.Treeview(right, columns=cat_columns, show="headings")
+        cat_columns = tuple(column for column, _label, _width in CATALOG_COLUMN_DEFINITIONS)
+        catalog_table = ttk.Frame(right)
+        catalog_table.pack(fill=tk.BOTH, expand=True)
+        catalog_table.columnconfigure(0, weight=1)
+        catalog_table.rowconfigure(0, weight=1)
+        self.catalog_tree = ttk.Treeview(catalog_table, columns=cat_columns, show="headings")
         self.catalog_heading_labels: dict[str, str] = {}
-        for column, label, width in (
-            ("name", "Name", 190),
-            ("template", "Template ID", 170),
-            ("category", "Category", 120),
-            ("grade", "Grade", 52),
-            ("stack", "Max", 50),
-        ):
+        for column, label, width in CATALOG_COLUMN_DEFINITIONS:
             self.catalog_heading_labels[column] = label
             self.catalog_tree.heading(
                 column,
                 text=label,
                 command=lambda selected=column: self._sort_catalog(selected),
             )
-            self.catalog_tree.column(
-                column, width=width, minwidth=42, stretch=column in {"name", "template"}
-            )
-        cat_scroll = ttk.Scrollbar(right, orient=tk.VERTICAL, command=self.catalog_tree.yview)
-        self.catalog_tree.configure(yscrollcommand=cat_scroll.set)
-        self.catalog_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        cat_scroll.pack(side=tk.LEFT, fill=tk.Y)
+            self.catalog_tree.column(column, width=width, minwidth=width, stretch=False)
+        cat_vertical_scroll = ttk.Scrollbar(
+            catalog_table, orient=tk.VERTICAL, command=self.catalog_tree.yview
+        )
+        self.catalog_horizontal_scroll = ttk.Scrollbar(
+            catalog_table, orient=tk.HORIZONTAL, command=self.catalog_tree.xview
+        )
+        self.catalog_tree.configure(
+            yscrollcommand=cat_vertical_scroll.set,
+            xscrollcommand=self.catalog_horizontal_scroll.set,
+        )
+        self.catalog_tree.grid(row=0, column=0, sticky="nsew")
+        cat_vertical_scroll.grid(row=0, column=1, sticky="ns")
+        self.catalog_horizontal_scroll.grid(row=1, column=0, sticky="ew")
         self.catalog_tree.bind("<Double-1>", lambda _event: self.add_item())
+        self._apply_catalog_columns()
+
+    def _apply_catalog_columns(self) -> None:
+        selections = {
+            column: variable.get() for column, variable in self.catalog_column_variables.items()
+        }
+        visible = visible_catalog_columns(selections)
+        self.catalog_tree.configure(displaycolumns=visible)
+        self.catalog_columns_button.configure(
+            text=f"Columns ({len(visible)}/{len(CATALOG_COLUMN_DEFINITIONS)})"
+        )
+
+    def _apply_inventory_columns(self) -> None:
+        selections = {
+            column: variable.get() for column, variable in self.inventory_column_variables.items()
+        }
+        visible = visible_inventory_columns(selections)
+        self.inventory_tree.configure(displaycolumns=visible)
+        self.inventory_columns_button.configure(
+            text=f"Columns ({len(visible)}/{len(INVENTORY_COLUMN_DEFINITIONS)})"
+        )
 
     def _build_stats_page(self, parent: ttk.Frame) -> None:
         ttk.Label(
@@ -563,9 +800,11 @@ class SaveEditorApp:
             players = opened.players()
             if not players:
                 raise SaveError("No player record was found in this save")
-            inventories = opened.carried_inventories(players[0].row_id)
+            carried = opened.carried_inventories(players[0].row_id)
+            vehicles = opened.vehicle_inventories(players[0].row_id)
+            inventories = [*carried, *vehicles]
             if not inventories:
-                raise SaveError("No carried inventory (type 0) was found for the player")
+                raise SaveError("No editable item-storage inventory was found for the player")
         except (OSError, SaveError, ValueError) as exc:
             messagebox.showerror("Could not open save", str(exc))
             return
@@ -574,17 +813,47 @@ class SaveEditorApp:
             self.save.close()
         self.save = opened
         self.player_row_id = players[0].row_id
-        self.inventory = inventories[0]
+        self._set_inventory_options(inventories)
         self.path_text.set(str(opened.path))
         self.save_button.configure(state=tk.NORMAL)
-        self._populate_inventory()
         self._populate_stats()
         self._populate_specializations()
         self._populate_factions()
         self.status_text.set(
             f"Opened {opened.path.name} — player {players[0].character_name} — "
-            f"inventory {self.inventory.inventory_id}"
+            f"{len(carried)} carried and {len(vehicles)} vehicle storage inventories"
         )
+
+    @staticmethod
+    def _inventory_label(inventory: Inventory) -> str:
+        owner = inventory.owner_kind
+        if owner not in {"Character", "Controller"} and inventory.owner_id is not None:
+            owner = f"{owner} #{inventory.owner_id}"
+        capacity = (
+            "unlimited slots"
+            if inventory.max_item_count is None or inventory.max_item_count < 0
+            else f"{inventory.max_item_count} slots"
+        )
+        return f"{owner} — {capacity} (inventory {inventory.inventory_id})"
+
+    def _set_inventory_options(self, inventories: list[Inventory]) -> None:
+        self.inventories = inventories
+        self.inventory_choices = {
+            self._inventory_label(inventory): inventory for inventory in inventories
+        }
+        labels = tuple(self.inventory_choices)
+        self.inventory_selector.configure(values=labels, state="readonly")
+        self.inventory_choice.set(labels[0])
+        self.inventory = self.inventory_choices[labels[0]]
+        self._populate_inventory()
+
+    def _select_inventory(self, _event: tk.Event | None = None) -> None:
+        inventory = self.inventory_choices.get(self.inventory_choice.get())
+        if inventory is None:
+            return
+        self.inventory = inventory
+        self._populate_inventory()
+        self.status_text.set(f"Editing {self._inventory_label(inventory)}")
 
     def _populate_stats(self) -> None:
         if not self.save or self.player_row_id is None:
@@ -700,14 +969,20 @@ class SaveEditorApp:
             self.inventory_tree.delete(row_id)
         self.inventory_rows.clear()
         if not self.save or not self.inventory:
+            self.inventory_weight_text.set("Max inventory weight: —")
             return
+        records = self.save.inventory_items(self.inventory.inventory_id)
+        self.inventory_weight_text.set(
+            inventory_weight_summary(self.inventory, records, self.catalog_by_id)
+        )
         needle = self.inventory_search.get().strip().casefold()
-        for record in self.save.inventory_items(self.inventory.inventory_id):
-            catalog_item = self.catalog_by_id.get(record.template_id)
+        for record in records:
+            catalog_item = catalog_item_for_template(self.catalog_by_id, record.template_id)
             name = catalog_item.display_name if catalog_item else record.template_id
             if needle and needle not in f"{name} {record.template_id}".casefold():
                 continue
-            durability = "" if record.durability is None else f"{record.durability:g}"
+            category = catalog_item.category if catalog_item else ""
+            weight = catalog_item.item_size if catalog_item else None
             row_id = self.inventory_tree.insert(
                 "",
                 tk.END,
@@ -715,9 +990,12 @@ class SaveEditorApp:
                     record.position_index,
                     name,
                     record.template_id,
+                    category,
                     record.stack_size,
                     record.quality_level,
-                    durability,
+                    durability_summary(record, catalog_item),
+                    "" if weight is None else _display_number(weight),
+                    "" if weight is None else _display_number(weight * record.stack_size),
                 ),
             )
             self.inventory_rows[row_id] = record
@@ -755,6 +1033,10 @@ class SaveEditorApp:
                 choice.item.max_stack_size,
                 choice.display_name.casefold(),
             ),
+            "weight": lambda choice: (
+                choice.item.item_size,
+                choice.display_name.casefold(),
+            ),
         }
         matches.sort(
             key=key_functions[self.catalog_sort_column],
@@ -777,6 +1059,7 @@ class SaveEditorApp:
                     category,
                     choice.quality_level or "",
                     item.max_stack_size,
+                    _display_number(item.item_size),
                 ),
             )
             self.catalog_rows[row_id] = choice
@@ -814,10 +1097,10 @@ class SaveEditorApp:
         for record in self.save.inventory_items(self.inventory.inventory_id):
             if replacing and record.item_id == replacing.item_id:
                 continue
-            catalog_item = self.catalog_by_id.get(record.template_id)
+            catalog_item = catalog_item_for_template(self.catalog_by_id, record.template_id)
             if catalog_item:
                 total += catalog_item.item_size * record.stack_size
-        added = self.catalog_by_id.get(template_id)
+        added = catalog_item_for_template(self.catalog_by_id, template_id)
         return total + ((added.item_size * quantity) if added else 0.0)
 
     def _volume_allowed(
@@ -892,7 +1175,7 @@ class SaveEditorApp:
         if not record:
             messagebox.showinfo("Select an item", "Select an inventory stack first.")
             return
-        catalog_item = self.catalog_by_id.get(record.template_id)
+        catalog_item = catalog_item_for_template(self.catalog_by_id, record.template_id)
         maximum = catalog_item.max_stack_size if catalog_item else 1_000_000
         value = simpledialog.askinteger(
             "Change quantity",
@@ -913,6 +1196,42 @@ class SaveEditorApp:
             return
         self._populate_inventory()
         self.status_text.set(f"Changed {record.template_id} quantity to {value} (not saved yet)")
+
+    def edit_durability(self) -> None:
+        if not self.save:
+            return
+        record = self._selected_inventory_item()
+        if not record:
+            messagebox.showinfo("Select an item", "Select an inventory item first.")
+            return
+        catalog_item = catalog_item_for_template(self.catalog_by_id, record.template_id)
+        maximum = effective_max_durability(record, catalog_item)
+        if maximum is None:
+            messagebox.showinfo(
+                "Durability unavailable",
+                "This item does not have a verified maximum durability.",
+            )
+            return
+        value = simpledialog.askfloat(
+            "Change durability",
+            f"Current durability for {record.template_id} (maximum {maximum:g}):",
+            initialvalue=record.durability if record.durability is not None else maximum,
+            minvalue=0.0,
+            maxvalue=maximum,
+            parent=self.root,
+        )
+        if value is None:
+            return
+        try:
+            self.save.update_item_durability(record.item_id, value, maximum)
+        except SaveError as exc:
+            messagebox.showerror("Could not change durability", str(exc))
+            return
+        self._populate_inventory()
+        self.status_text.set(
+            f"Changed {record.template_id} durability to {_display_number(value)}/"
+            f"{_display_number(maximum)} (not saved yet)"
+        )
 
     def remove_item(self) -> None:
         if not self.save:
@@ -969,6 +1288,35 @@ class SaveEditorApp:
         if self.save:
             self.save.close()
         self.root.destroy()
+
+    def _start_update_check(self) -> None:
+        thread = threading.Thread(target=self._fetch_update, daemon=True)
+        thread.start()
+        self.root.after(100, self._poll_update_check)
+
+    def _fetch_update(self) -> None:
+        self._update_results.put(check_for_update(__version__))
+
+    def _poll_update_check(self) -> None:
+        try:
+            release = self._update_results.get_nowait()
+        except queue.Empty:
+            self.root.after(100, self._poll_update_check)
+            return
+        if release is not None:
+            self._prompt_for_update(release)
+
+    def _prompt_for_update(self, release: ReleaseInfo) -> None:
+        release_name = release.name or release.tag_name
+        if messagebox.askyesno(
+            "Update available",
+            f"{release_name} is available.\n\n"
+            f"Installed version: {__version__}\n"
+            f"Available version: {release.tag_name}\n\n"
+            "Open GitHub Releases to download and install it?",
+            parent=self.root,
+        ):
+            webbrowser.open(RELEASES_PAGE_URL, new=2)
 
 
 def main() -> None:

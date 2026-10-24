@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dune-awakening-save-editor"
-version = "1.0.0a1"
+version = "1.0.0a2"
 description = "Offline inventory and character editor for Dune: Awakening solo saves"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -17,7 +17,7 @@ dev = ["pytest>=8", "ruff>=0.8"]
 dune-save-editor = "dune_save_editor.app:main"
 
 [tool.setuptools.package-data]
-dune_save_editor = ["data/*.json"]
+dune_save_editor = ["assets/*.ico", "assets/*.png", "data/*.json"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
