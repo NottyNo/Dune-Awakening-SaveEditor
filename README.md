@@ -12,13 +12,13 @@ prebuilt Windows executable is included yet.
 
 Python 3.11 or newer with Tk support is required.
 
-```powershell
+```
 python run_editor.py
 ```
 
 After installing the package, the equivalent command is:
 
-```powershell
+```
 python -m dune_save_editor
 ```
 
@@ -104,7 +104,7 @@ than extracting the datatables themselves.
 
 For contributors or maintainers who have a new FModel export, rebuild the catalog with:
 
-```powershell
+```
 python tools/build_item_catalog.py "C:\path\to\DuneSandbox\Content\Dune\Systems\Items"
 ```
 
@@ -121,7 +121,7 @@ include the regenerated catalog in the next release.
 
 ## Development
 
-```powershell
+```
 python -m pytest
 python -m compileall src tests tools
 python -m ruff check .
